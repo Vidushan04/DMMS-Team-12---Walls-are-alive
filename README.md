@@ -33,12 +33,4 @@ Operating Modes
 | **TELEOP** | Manual remote control      | Serial ‘M’ |
 | **E-STOP** | Emergency halt (latched)   | Serial ‘E’ |
 
-State 'Auto Mode'
 
-FORWARD  → (obstacle) → TURN_LEFT / TURN_RIGHT
-   │
-   ├─ (both sides blocked) → PAUSE_BLOCKED
-   │                          │
-   │                          ├─ (timeout) → BACKUP → SCAN_SPOT → FORWARD
-   │                          └─ (side clear) → TURN_LEFT / TURN_RIGHT
-   └─ (stuck) → BACKUP → SCAN_SPOT → FORWARD

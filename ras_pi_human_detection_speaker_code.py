@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+"""
+Human detection with IMX500 (Picamera2) + speaker feedback.
+
+Notes for reviewers:
+- Base pipeline follows the standard IMX500 object-detection demo.
+- Additions are marked with [ADDED] comments:
+  * Robust audio playback to the Raspberry Pi headphone jack (ALSA).
+  * Headless operation over SSH (no DRM preview plane).
+  * "Near-person" gating using bounding-box area as a distance proxy,
+    ROI ignore bands, and persistence across frames to reduce flicker.
+"""
+
 import argparse
 import sys
 from functools import lru_cache
@@ -10,37 +23,40 @@ from picamera2.devices import IMX500
 from picamera2.devices.imx500 import (NetworkIntrinsics,
                                       postprocess_nanodet_detection)
  
-# --- NEW: time + subprocess + random
-import time
-import subprocess
-import random
-from collections import deque  # --- NEW
+# [ADDED] extra stdlib for timing/sound/persistence
+import time                 # cooldown + loop timing
+import subprocess           # launching aplay for WAV playback
+from collections import deque  # persistence across frames
  
+# ------------------------------------------------------------------
+# [ADDED] Sound output (ALSA) — stable device string + simple player
+# ------------------------------------------------------------------
 last_detections = []
-DEBUG_TEST = ""     ### NEW FOR TESTING ###
- 
-# ====== SOUND CONFIG ======
-APLAY_DEV = 'plughw:CARD=Headphones,DEV=0'   # --- CHANGED (stable across HDMI/no-HDMI)
-SOUND_PATH = '/home/pi/sounds/gtts_download_hello.wav' # greeting file path
- 
-SAY_COOLDOWN_S = 3.0
-_last_sound_time = 0.0
+APLAY_DEV = 'plughw:CARD=Headphones,DEV=0'              # [ADDED] address analog jack by NAME so HDMI/no-HDMI index flips don’t break audio
+SOUND_PATH = '/home/pi/sounds/gtts_download_hello.wav'  # [ADDED] local WAV to play when a near person is confirmed
+SAY_COOLDOWN_S = 3.0                                    # [ADDED] minimum gap between plays so the robot isn’t too chatty
+_last_sound_time = 0.0                                  # [ADDED] cooldown tracker
  
 def make_sound():
-    """Play a short WAV through the analog jack."""
+    """[ADDED] Play a short WAV through the analog jack (non-blocking)."""
     subprocess.Popen([
         "bash", "-lc",
         f'aplay -q -D "{APLAY_DEV}" "{SOUND_PATH}"'
     ])
-# ==========================
- 
+
+# ------------------------------------------------------------------
+# Standard IMX500 detection data container (unchanged)
+# ------------------------------------------------------------------
 class Detection:
     def __init__(self, coords, category, conf, metadata):
         """Create a Detection object, recording the bounding box, category and confidence."""
         self.category = category
         self.conf = conf
         self.box = imx500.convert_inference_coords(coords, metadata, picam2)
- 
+
+# ------------------------------------------------------------------
+# Standard IMX500 post-processing (unchanged)
+# ------------------------------------------------------------------
 def parse_detections(metadata: dict):
     """Parse the output tensor into a number of detected objects, scaled to the ISP output."""
     global last_detections
@@ -83,7 +99,9 @@ def get_labels():
         labels = [label for label in labels if label and label != "-"]
     return labels
  
-# (kept for preview builds; we’re headless now)
+# ------------------------------------------------------------------
+# Optional preview overlay (kept for desktop testing)
+# ------------------------------------------------------------------
 def draw_detections(request, stream="main"):
     detections = last_results
     if detections is None:
@@ -101,11 +119,10 @@ def draw_detections(request, stream="main"):
             cv2.putText(m.array, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
             cv2.rectangle(m.array, (x, y), (x + w, y + h), (0,255,0,0), thickness=2)
            
-            ### NEW FOR TESTING ###
+            # [ADDED] quick on-screen debug: shows confidence + normalized box area (distance proxy)
             global W, H
             area_frac = (w * h) / float(W * H)
             cv2.putText(m.array, f"conf={float(detection.conf):.2f} area={area_frac*100:.1f}%", (x, max(0, y-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1, cv2.LINE_AA)
-            ### NEW FOR TESTING ###
  
         if intrinsics.preserve_aspect_ratio:
             b_x, b_y, b_w, b_h = imx500.get_roi_scaled(request)
@@ -113,6 +130,9 @@ def draw_detections(request, stream="main"):
             cv2.putText(m.array, "ROI", (b_x + 5, b_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             cv2.rectangle(m.array, (b_x, b_y), (b_x + b_w, b_y + b_h), (255,0,0,0))
  
+# ------------------------------------------------------------------
+# Standard CLI args (unchanged, except we honour --print-intrinsics)
+# ------------------------------------------------------------------
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str,
@@ -127,30 +147,31 @@ def get_args():
     parser.add_argument("--postprocess", choices=["", "nanodet"], default=None)
     parser.add_argument("-r", "--preserve-aspect-ratio", action=argparse.BooleanOptionalAction)
     parser.add_argument("--labels", type=str)
+    # (print_intrinsics is optional; guarded below)
     return parser.parse_args()
- 
-# ====== NEAR/FAR FILTER CONFIG ======
-# CONF_THRESH_NEAR = 0.70        # higher than default to reduce false positives  # --- NEW
-# PERSIST_FRAMES   = 3           # need N consecutive frames                     # --- NEW
-# MIN_AREA_FRAC    = 0.06        # >= 6% of frame area ⇒ “near-ish”             # --- NEW
-# MAX_AREA_FRAC    = 0.80        # ignore absurdly large boxes                   # --- NEW
-# IGNORE_TOP_FRAC  = 0.15        # ignore top band (far/doors)                   # --- NEW
-# IGNORE_BOTTOM_FRAC = 0.05      # small bottom band ignore if needed            # --- NEW
- 
-CONF_THRESH_NEAR = 0.55        # higher than default to reduce false positives  # --- NEW
-PERSIST_FRAMES   = 2           # need N consecutive frames                     # --- NEW
-MIN_AREA_FRAC    = 0.10        # >= 6% of frame area ⇒ “near-ish”             # --- NEW
-MAX_AREA_FRAC    = 0.80        # ignore absurdly large boxes                   # --- NEW
-IGNORE_TOP_FRAC  = 0.05        # ignore top band (far/doors)                   # --- NEW
+
+# ------------------------------------------------------------------
+# [ADDED] Near/Far gating to react only to "close" persons
+#   - CONF_THRESH_NEAR: higher confidence for robustness
+#   - MIN_AREA_FRAC: bounding-box area fraction cutoff (distance proxy)
+#   - IGNORE_*_FRAC: trim top/bottom bands to ignore distant/edge clutter
+#   - PERSIST_FRAMES: require N consecutive frames (de-flicker)
+# ------------------------------------------------------------------
+CONF_THRESH_NEAR = 0.55
+PERSIST_FRAMES   = 2
+MIN_AREA_FRAC    = 0.10   # start ~10%; raise/lower to tune 2–3 m trigger
+MAX_AREA_FRAC    = 0.80
+IGNORE_TOP_FRAC  = 0.05
 IGNORE_BOTTOM_FRAC = 0.01
+_presence = deque(maxlen=PERSIST_FRAMES)  # [ADDED] rolling “seen-near” history
  
-_presence = deque(maxlen=PERSIST_FRAMES)  # rolling history                     # --- NEW
-# =====================================
- 
+# ==================================================================
+# Main
+# ==================================================================
 if __name__ == "__main__":
     args = get_args()
  
-    # Must be called before Picamera2
+    # Must be called before Picamera2 (standard)
     imx500 = IMX500(args.model)
     intrinsics = imx500.network_intrinsics
     if not intrinsics:
@@ -160,7 +181,7 @@ if __name__ == "__main__":
         print("Network is not an object detection task", file=sys.stderr)
         exit()
  
-    # Override intrinsics from args
+    # Override intrinsics from args (unchanged)
     for key, value in vars(args).items():
         if key == 'labels' and value is not None:
             with open(value, 'r') as f:
@@ -168,51 +189,58 @@ if __name__ == "__main__":
         elif hasattr(intrinsics, key) and value is not None:
             setattr(intrinsics, key, value)
  
-    # Defaults
+    # Defaults (unchanged)
     if intrinsics.labels is None:
         with open("assets/coco_labels.txt", "r") as f:
             intrinsics.labels = f.read().splitlines()
     intrinsics.update_with_defaults()
  
-    # if args.print_intrinsics:
-        # print(intrinsics)
-        # exit()
+    # Optional: print intrinsics then exit (guarded to avoid AttributeError)
     if getattr(args, "print_intrinsics", False):
         print(intrinsics)
         sys.exit(0)
  
+    # Camera config (standard)
     picam2 = Picamera2(imx500.camera_num)
     config = picam2.create_preview_configuration(controls={"FrameRate": intrinsics.inference_rate}, buffer_count=12)
  
     imx500.show_network_fw_progress_bar()
-    # picam2.start(config, show_preview=True)
-    # Headless over SSH
-    picam2.start(config, show_preview=False)   # --- CHANGED
+
+    # [ADDED] Headless by default for SSH/robot use:
+    # show_preview=False avoids DRM plane errors when no HDMI is attached.
+    picam2.start(config, show_preview=False)
  
     if intrinsics.preserve_aspect_ratio:
         imx500.set_auto_aspect_ratio()
  
     last_results = None
-    # picam2.pre_callback = draw_detections  # keep disabled when headless
+    # [ADDED] Preview callback left disabled for headless mode.
+    # Enable these two lines during desktop tests:
+    # picam2.start(config, show_preview=True)
+    # picam2.pre_callback = draw_detections
  
-    # cache labels
+    # [ADDED] Cache labels once; fall back safely
     _labels = None
     try:
         _labels = get_labels()
     except Exception:
         _labels = None
  
-    # Get ISP output size from config for area fraction (fallback to 640x480)
+    # [ADDED] Frame size for area-fraction maths (distance proxy)
     try:
-        W = config["main"]["size"][0]   # --- NEW
+        W = config["main"]["size"][0]
         H = config["main"]["size"][1]
     except Exception:
-        W, H = 640, 480                 # --- NEW
+        W, H = 640, 480
  
+    # -------------------------
+    # Main capture/detect loop
+    # -------------------------
     while True:
         last_results = parse_detections(picam2.capture_metadata())
  
-        saw_person_this_frame = False   # --- NEW
+        # [ADDED] Single-frame "near person" decision (before persistence)
+        saw_person_this_frame = False
         if last_results:
             labels = _labels or get_labels()
  
@@ -226,25 +254,27 @@ if __name__ == "__main__":
                     continue
  
                 x, y, w, h = d.box
-                # ROI gating (ignore distant/top & tiny bottom)
+
+                # [ADDED] ROI gating: ignore very top/bottom bands (far doors, table edges)
                 if y < int(H * IGNORE_TOP_FRAC):
                     continue
                 if (y + h) > int(H * (1 - IGNORE_BOTTOM_FRAC)):
                     continue
  
-                # Size gating as distance proxy
+                # [ADDED] Distance proxy via area fraction: larger box ≈ closer person
                 area_frac = (w * h) / float(W * H)
                 if area_frac < MIN_AREA_FRAC or area_frac > MAX_AREA_FRAC:
                     continue
  
-                # Passed all filters → “near” this frame
+                # passed all gates -> mark this frame as "near person"
                 saw_person_this_frame = True
                 break
  
-        # persistence across frames
-        _presence.append(saw_person_this_frame)          # --- NEW
-        saw_person_persistent = all(_presence)           # --- NEW
+        # [ADDED] Persistence: require N consecutive frames to reduce flicker/false triggers
+        _presence.append(saw_person_this_frame)
+        saw_person_persistent = all(_presence)
  
+        # [ADDED] Cooldown + sound: only play when near-person is stable AND cooldown passed
         now = time.monotonic()
         if saw_person_persistent and (now - _last_sound_time) >= SAY_COOLDOWN_S:
             make_sound()
